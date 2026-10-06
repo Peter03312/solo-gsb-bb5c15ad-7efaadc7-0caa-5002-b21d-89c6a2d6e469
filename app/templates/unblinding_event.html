@@ -9,16 +9,44 @@
 </div>
 <h2>映射快照（{{ snapshot['mapping']|length }} 条）</h2>
 <table>
-  <thead><tr><th>样品码</th><th>分层</th><th>处理组</th></tr></thead>
+  <thead><tr><th>样品码</th><th>状态</th><th>替换关系</th><th>分层</th><th>处理组</th></tr></thead>
   <tbody>
     {% for m in snapshot['mapping'] %}
     <tr>
       <td><code>{{ m['code'] }}</code></td>
+      <td>{{ '已作废' if m['status'] == 'voided' else '有效' }}</td>
+      <td>
+        {% if m['replacement_of_code'] %}替换 {{ m['replacement_of_code'] }}
+        {% elif m['replaced_by_code'] %}→ {{ m['replaced_by_code'] }}
+        {% else %}—{% endif %}
+      </td>
       <td>{{ m['stratum'] }}</td>
       <td><strong>{{ m['group_name'] }}</strong></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+
+{% if snapshot['replacements'] %}
+<h2>补发链快照（{{ snapshot['replacements']|length }} 条）</h2>
+<table>
+  <thead><tr><th>#</th><th>请求标识</th><th>原码</th><th>新码</th><th>分层</th><th>处理组</th><th>原因</th><th>办理人</th><th>时间</th></tr></thead>
+  <tbody>
+    {% for r in snapshot['replacements'] %}
+    <tr>
+      <td>{{ r['id'] }}</td>
+      <td><code>{{ r['request_id'] }}</code></td>
+      <td><code>{{ r['old_code'] }}</code></td>
+      <td><code>{{ r['new_code'] }}</code></td>
+      <td>{{ r['stratum'] }}</td>
+      <td>{{ r['group_name'] }}</td>
+      <td>{{ r['reason'] }}</td>
+      <td>{{ r['requested_by'] }}</td>
+      <td>{{ r['created_at'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
 <p><a href="{{ url_for('routes.study_detail', study_id=study['id']) }}">← 返回研究详情</a></p>
 {% endblock %}

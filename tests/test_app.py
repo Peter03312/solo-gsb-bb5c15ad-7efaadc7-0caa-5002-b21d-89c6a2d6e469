@@ -243,3 +243,292 @@ def test_pages_render(client):
     client.post(f"/api/studies/{sid}/generate")
     for path in ["/", f"/studies/{sid}", f"/studies/{sid}/mapping", f"/studies/{sid}/unblind"]:
         assert client.get(path).status_code == 200, path
+
+
+# ---------------------------------------------------------------- 样品补发
+
+def _first_code(client, sid):
+    return client.get(f"/api/studies/{sid}/codes").get_json()["codes"][0]
+
+
+def _replace(client, sid, old_code, reason="样品运输途中损毁，无法检测", request_id="req-1"):
+    return client.post(
+        f"/api/studies/{sid}/replacements",
+        json={"old_code": old_code, "reason": reason, "request_id": request_id},
+    )
+
+
+def _setup_with_codes(client):
+    login(client, ADMIN)
+    sid = make_study(client)
+    client.post(f"/api/studies/{sid}/generate")
+    old = _first_code(client, sid)
+    return sid, old
+
+
+def test_replace_success_voids_old_and_inherits_group(client):
+    sid, old = _setup_with_codes(client)
+    r = _replace(client, sid, old["code"])
+    assert r.status_code == 201, r.get_json()
+    body = r.get_json()
+    assert body["replayed"] is False
+    repl = body["replacement"]
+    assert repl["old_code"] == old["code"]
+    assert repl["new_code"].startswith("SMP-")
+    assert repl["new_code"] != old["code"]
+
+    # 新码继承原分层与处理组（管理员可见组别）
+    admin_mapping = {
+        m["code"]: m for m in client.get(f"/api/studies/{sid}/mapping").get_json()["mapping"]
+    }
+    o, n = admin_mapping[old["code"]], admin_mapping[repl["new_code"]]
+    assert o["status"] == "voided"
+    assert o["replaced_by_code"] == repl["new_code"]
+    assert n["status"] == "active"
+    assert n["replacement_of_code"] == old["code"]
+    assert n["stratum"] == o["stratum"]
+    assert n["group_name"] == o["group_name"]
+
+    # 有效码总数不变（原码作废 + 新码有效）
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    assert len(codes) == 21
+    assert sum(1 for c in codes if c["status"] == "active") == 20
+    assert sum(1 for c in codes if c["status"] == "voided") == 1
+
+    # 补发记录可查（含请求标识、原因、继承的分层/组别）
+    repls = client.get(f"/api/studies/{sid}/replacements").get_json()["replacements"]
+    assert len(repls) == 1
+    assert repls[0]["old_code"] == old["code"]
+    assert repls[0]["new_code"] == repl["new_code"]
+    assert repls[0]["stratum"] == o["stratum"]
+    assert repls[0]["group_name"] == o["group_name"]
+
+
+def test_replace_idempotent_same_request_id_returns_original(client):
+    sid, old = _setup_with_codes(client)
+    reason = "样品运输途中损毁，无法检测"
+    r1 = _replace(client, sid, old["code"], reason=reason, request_id="idem-1")
+    assert r1.status_code == 201
+    new_code = r1.get_json()["replacement"]["new_code"]
+
+    r2 = _replace(client, sid, old["code"], reason=reason, request_id="idem-1")
+    assert r2.status_code == 200
+    body = r2.get_json()
+    assert body["replayed"] is True
+    assert body["replacement"]["new_code"] == new_code
+
+    # 未产生第二条补发/第二个新码
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    assert sum(1 for c in codes if c["status"] == "voided") == 1
+    assert len(client.get(f"/api/studies/{sid}/replacements").get_json()["replacements"]) == 1
+
+
+def test_replace_same_request_id_changed_params_rejected(client):
+    sid, old = _setup_with_codes(client)
+    assert _replace(client, sid, old["code"], request_id="dup-1").status_code == 201
+
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    other = next(c for c in codes if c["code"] != old["code"] and c["status"] == "active")
+
+    # 改换样品码 -> 409
+    r = _replace(client, sid, other["code"], request_id="dup-1")
+    assert r.status_code == 409
+    # 改换原因 -> 409
+    r = _replace(client, sid, old["code"], reason="另一个不同的补发原因哦", request_id="dup-1")
+    assert r.status_code == 409
+
+    # 数据未变
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    assert sum(1 for c in codes if c["status"] == "voided") == 1
+
+
+def test_replace_validation_failures_leave_data_unchanged(client):
+    sid, old = _setup_with_codes(client)
+
+    # 码不存在
+    r = _replace(client, sid, "SMP-NOPE000")
+    assert r.status_code == 400
+    assert any("不存在" in e for e in r.get_json()["errors"])
+
+    # 原因空白
+    r = _replace(client, sid, old["code"], reason="   ")
+    assert r.status_code == 400
+    assert any("原因" in e for e in r.get_json()["errors"])
+
+    # 请求标识空白
+    r = _replace(client, sid, old["code"], request_id="")
+    assert r.status_code == 400
+
+    # 已作废的码
+    _replace(client, sid, old["code"], request_id="ok-1")
+    r = _replace(client, sid, old["code"], request_id="other-2")
+    assert r.status_code == 400
+    assert any("作废" in e for e in r.get_json()["errors"])
+
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    assert len(codes) == 21  # 只有一次成功补发
+    assert sum(1 for c in codes if c["status"] == "voided") == 1
+
+
+def test_replace_rejected_after_unblinding_and_retry_returns_original(client):
+    sid, old = _setup_with_codes(client)
+    r1 = _replace(client, sid, old["code"], request_id="before-unblind")
+    assert r1.status_code == 201
+    original = r1.get_json()["replacement"]
+
+    client.post(
+        f"/api/studies/{sid}/unblind",
+        json={
+            "operator1": "operator1", "password1": "op123456",
+            "operator2": "operator2", "password2": "op234567",
+            "reason": REASON,
+        },
+    )
+
+    # 揭盲后新请求失败且不改变数据
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    active = next(c for c in codes if c["status"] == "active")
+    r = _replace(client, sid, active["code"], request_id="after-unblind")
+    assert r.status_code == 400
+    assert any("揭盲" in e for e in r.get_json()["errors"])
+    assert len(client.get(f"/api/studies/{sid}/codes").get_json()["codes"]) == 21
+
+    # 揭盲前成功的请求在揭盲后重试仍返回原记录
+    r = _replace(client, sid, old["code"], request_id="before-unblind")
+    assert r.status_code == 200
+    assert r.get_json()["replacement"]["new_code"] == original["new_code"]
+
+
+def test_replace_admin_only(client):
+    login(client, ADMIN)
+    sid = make_study(client)
+    client.post(f"/api/studies/{sid}/generate")
+    code = _first_code(client, sid)["code"]
+    login(client, {"username": "operator1", "password": "op123456"})
+    r = _replace(client, sid, code)
+    assert r.status_code == 403
+    login(client, VIEWER)
+    r = _replace(client, sid, code)
+    assert r.status_code == 403
+
+
+def test_viewer_blinded_to_replacement_group_before_unblinding(client):
+    sid, old = _setup_with_codes(client)
+    _replace(client, sid, old["code"])
+
+    login(client, VIEWER)
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()
+    assert codes["blinded"] is True
+    for c in codes["codes"]:
+        assert c["group_name"] is None
+        # 状态与替换关系仍可见，且不泄露组别
+        assert c["status"] in ("active", "voided")
+    repls = client.get(f"/api/studies/{sid}/replacements").get_json()
+    assert all(r["group_name"] is None for r in repls["replacements"])
+
+
+def test_unblinding_snapshot_keeps_full_replacement_chain(client):
+    sid, old = _setup_with_codes(client)
+    _replace(client, sid, old["code"], request_id="chain-1")
+
+    client.post(
+        f"/api/studies/{sid}/unblind",
+        json={
+            "operator1": "operator1", "password1": "op123456",
+            "operator2": "operator2", "password2": "op234567",
+            "reason": REASON,
+        },
+    )
+    snap = client.get(f"/api/studies/{sid}/unblinding-events").get_json()["events"][0]["snapshot"]
+
+    by_code = {m["code"]: m for m in snap["mapping"]}
+    assert by_code[old["code"]]["status"] == "voided"
+    assert len(snap["replacements"]) == 1
+    chain = snap["replacements"][0]
+    assert chain["old_code"] == old["code"]
+    assert by_code[chain["new_code"]]["replacement_of_code"] == old["code"]
+    assert chain["request_id"] == "chain-1"
+    assert chain["reason"]
+    assert chain["group_name"] == by_code[chain["new_code"]]["group_name"]
+
+
+def test_concurrent_replacements_of_same_code_only_one_succeeds(client):
+    import threading
+
+    login(client, ADMIN)
+    sid = make_study(client)
+    client.post(f"/api/studies/{sid}/generate")
+    old = _first_code(client, sid)["code"]
+    reason = "样品运输途中损毁，无法检测"
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def worker(rid):
+        c = client.application.test_client()
+        r = c.post("/api/login", json=ADMIN)
+        assert r.status_code == 200
+        barrier.wait()
+        resp = c.post(
+            f"/api/studies/{sid}/replacements",
+            json={"old_code": old, "reason": reason, "request_id": rid},
+        )
+        results.append((resp.status_code, resp.get_json()))
+
+    t1 = threading.Thread(target=worker, args=("conc-1",))
+    t2 = threading.Thread(target=worker, args=("conc-2",))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    statuses = sorted(s for s, _ in results)
+    assert statuses[0] in (200, 201)
+    assert statuses[1] == 400  # 第二个请求：码已作废
+    codes = client.get(f"/api/studies/{sid}/codes").get_json()["codes"]
+    assert sum(1 for c in codes if c["status"] == "voided") == 1
+    assert len([c for c in codes if c["replacement_of_code"]]) == 1
+    assert len(client.get(f"/api/studies/{sid}/replacements").get_json()["replacements"]) == 1
+
+
+def test_replacement_code_globally_unique_across_studies(client):
+    login(client, ADMIN)
+    sid1 = make_study(client, name="研究甲")
+    client.post(f"/api/studies/{sid1}/generate")
+    sid2 = make_study(client, name="研究乙")
+    client.post(f"/api/studies/{sid2}/generate")
+
+    code1 = _first_code(client, sid1)["code"]
+    r = _replace(client, sid1, code1, request_id="g-1")
+    assert r.status_code == 201
+    new_code = r.get_json()["replacement"]["new_code"]
+
+    other = client.get(f"/api/studies/{sid2}/codes").get_json()["codes"]
+    assert all(c["code"] != new_code for c in other)
+    assert new_code != code1
+
+
+def test_multi_hop_replacement_chain(client):
+    sid, a = _setup_with_codes(client)
+    r1 = _replace(client, sid, a["code"], request_id="hop-1")
+    b = r1.get_json()["replacement"]["new_code"]
+    assert r1.get_json()["replacement"]["new_code_status"] == "active"
+
+    # 新码再次损毁 -> 继续补发，形成 A -> B -> C
+    r2 = _replace(client, sid, b, reason="第二次损毁原因足够长哦", request_id="hop-2")
+    c = r2.get_json()["replacement"]["new_code"]
+
+    by_code = {x["code"]: x for x in client.get(f"/api/studies/{sid}/codes").get_json()["codes"]}
+    assert by_code[a["code"]]["status"] == "voided"
+    assert by_code[a["code"]]["replaced_by_code"] == b
+    assert by_code[b]["status"] == "voided"
+    assert by_code[b]["replacement_of_code"] == a["code"]
+    assert by_code[b]["replaced_by_code"] == c
+    assert by_code[c]["status"] == "active"
+    assert by_code[c]["replacement_of_code"] == b
+
+    # 重试第一跳：仍返回原记录 B，但 B 此刻已作废
+    r = _replace(client, sid, a["code"], request_id="hop-1")
+    assert r.status_code == 200
+    assert r.get_json()["replayed"] is True
+    assert r.get_json()["replacement"]["new_code"] == b
+    assert r.get_json()["replacement"]["new_code_status"] == "voided"
+

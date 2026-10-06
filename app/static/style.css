@@ -23,5 +23,6 @@ fieldset { border: 1px solid #ccc; border-radius: 6px; margin: .8rem 0; }
 .badge { font-size: .8rem; border-radius: 10px; padding: .15rem .6rem; }
 .badge.active { background: #dce8f7; color: #1f3a5f; }
 .badge.unblinded { background: #f7e2dc; color: #a33; }
+.badge.voided { background: #e6e6e6; color: #666; text-decoration: line-through; }
 .hint { color: #666; font-size: .85rem; }
 code { background: #eef1f5; padding: .1rem .3rem; border-radius: 3px; }

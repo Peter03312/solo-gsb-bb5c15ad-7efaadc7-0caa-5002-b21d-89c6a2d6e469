@@ -17,7 +17,7 @@ from flask import (
 from . import services
 from .auth import authenticate, login_required, role_required
 from .db import get_db
-from .services import ConflictError, ServiceError
+from .services import ConflictError, ReplacementConflictError, ServiceError
 
 bp = Blueprint("routes", __name__)
 
@@ -81,9 +81,8 @@ def study_detail(study_id):
     groups = db.execute(
         "SELECT * FROM treatment_groups WHERE study_id = ? ORDER BY id", (study_id,)
     ).fetchall()
-    codes = db.execute(
-        "SELECT * FROM codes WHERE study_id = ? ORDER BY id", (study_id,)
-    ).fetchall()
+    codes = services.get_codes_with_chain(db, study_id)
+    replacements = services.get_replacements(db, study_id)
     events = db.execute(
         "SELECT * FROM unblinding_events WHERE study_id = ? ORDER BY id DESC",
         (study_id,),
@@ -94,6 +93,7 @@ def study_detail(study_id):
         strata=strata,
         groups=groups,
         codes=codes,
+        replacements=replacements,
         events=events,
         can_view_mapping=services.can_view_mapping(study, g.user),
     )
@@ -114,6 +114,37 @@ def generate(study_id):
             flash(f"冲突样品码：{code}", "error")
         if len(e.conflicts) > 20:
             flash(f"……冲突共 {len(e.conflicts)} 个，仅列出前 20 个", "error")
+    except ServiceError as e:
+        for err in e.errors:
+            flash(err, "error")
+    return redirect(url_for("routes.study_detail", study_id=study_id))
+
+
+@bp.route("/studies/<int:study_id>/replace", methods=("POST",))
+@role_required("admin")
+def replace_code(study_id):
+    db = get_db()
+    study = _get_study_or_404(db, study_id)
+    try:
+        record, replayed = services.replace_code(
+            db,
+            study,
+            request.form.get("old_code", ""),
+            request.form.get("reason", ""),
+            request.form.get("request_id", ""),
+            g.user["username"],
+        )
+        if replayed:
+            flash(
+                f"该请求标识已办理过补发：{record['old_code']} → {record['new_code']}（返回原结果）",
+                "ok",
+            )
+        else:
+            flash(
+                f"补发成功：原码 {record['old_code']} 已作废，新码 {record['new_code']}"
+                " 已继承原分层与处理组",
+                "ok",
+            )
     except ServiceError as e:
         for err in e.errors:
             flash(err, "error")
@@ -267,18 +298,53 @@ def api_codes(study_id):
     if study is None:
         return jsonify(ok=False, errors=["研究不存在"]), 404
     show_group = services.can_view_mapping(study, g.user)
-    rows = db.execute(
-        "SELECT code, stratum, group_name, batch_id, issued_at"
-        " FROM codes WHERE study_id = ? ORDER BY id",
-        (study_id,),
-    ).fetchall()
-    codes = []
-    for r in rows:
-        item = dict(r)
+    codes = services.get_codes_with_chain(db, study_id)
+    for item in codes:
+        item.pop("id", None)
         if not show_group:
             item["group_name"] = None  # 未授权不返回组别
-        codes.append(item)
     return jsonify(ok=True, codes=codes, blinded=not show_group)
+
+
+@bp.post("/api/studies/<int:study_id>/replacements")
+@role_required("admin")
+def api_replace_code(study_id):
+    db = get_db()
+    study = db.execute("SELECT * FROM studies WHERE id = ?", (study_id,)).fetchone()
+    if study is None:
+        return jsonify(ok=False, errors=["研究不存在"]), 404
+    data = request.get_json(silent=True) or request.form
+    try:
+        record, replayed = services.replace_code(
+            db,
+            study,
+            data.get("old_code", ""),
+            data.get("reason", ""),
+            data.get("request_id", ""),
+            g.user["username"],
+        )
+    except ReplacementConflictError as e:
+        return jsonify(ok=False, errors=e.errors), 409
+    except ServiceError as e:
+        return jsonify(ok=False, errors=e.errors), 400
+    body = dict(ok=True, replayed=replayed, replacement=record)
+    return jsonify(body), (200 if replayed else 201)
+
+
+@bp.get("/api/studies/<int:study_id>/replacements")
+@login_required
+def api_replacements(study_id):
+    db = get_db()
+    study = db.execute("SELECT * FROM studies WHERE id = ?", (study_id,)).fetchone()
+    if study is None:
+        return jsonify(ok=False, errors=["研究不存在"]), 404
+    show_group = services.can_view_mapping(study, g.user)
+    replacements = services.get_replacements(db, study_id)
+    for item in replacements:
+        item.pop("study_id", None)
+        if not show_group:
+            item["group_name"] = None  # 揭盲前普通用户看不到处理组
+    return jsonify(ok=True, replacements=replacements, blinded=not show_group)
 
 
 @bp.get("/api/studies/<int:study_id>/mapping")

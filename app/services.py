@@ -1,15 +1,19 @@
-"""核心业务逻辑：盲法编码生成与揭盲。
+"""核心业务逻辑：盲法编码生成、补发与揭盲。
 
 设计要点：
 - 样品码由 (研究种子, 研究名称, 分层, 处理组, 数量) 确定性生成，本身不含组别含义；
 - 样品码全局唯一（数据库唯一约束兜底），一经发放不可复用；
 - 生成前先做平衡性/缺失校验与冲突预检，任一失败整批拒绝、不落库；
+- 样品损毁可由管理员补发：原码立即作废（保留历史），新码继承原分层与处理组；
+  补发以“研究内请求标识”幂等，相同标识重试返回原结果，改参数则拒绝；
+  并发补发同一有效码仅能成功一次（BEGIN IMMEDIATE 串行化）；
 - 揭盲需两位不同操作者（账号+口令，且具备揭盲权限）及完整理由，
-  全部条件满足才在单个事务内写入揭盲事件（含映射快照）并更新研究状态。
+  全部条件满足才在单个事务内写入揭盲事件（含完整映射与补发链快照）并更新研究状态。
 """
 
 import json
 import random
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 
@@ -39,6 +43,10 @@ class ConflictError(ServiceError):
         super().__init__(
             [f"本次生成将复用 {len(self.conflicts)} 个已发放的样品码，整批已拒绝"]
         )
+
+
+class ReplacementConflictError(ServiceError):
+    """补发请求与既有请求冲突（请求标识已被同研究的其它补发参数占用）。"""
 
 
 def utcnow():
@@ -240,17 +248,215 @@ def generate_batch(db, study, username):
     return batch_id, len(plan)
 
 
-# ---------------------------------------------------------------- 映射与揭盲
+# ---------------------------------------------------------------- 样品补发
 
-def get_mapping(db, study_id):
+def _new_replacement_code(db):
+    """生成一个与任何已发放码（含已作废码）都不重复的补发码。
+
+    补发是一次性事件，不沿用确定性种子（否则会与原批次码冲突），
+    改用加密级随机源生成；codes.code 的全局唯一约束为最终防线。
+    """
+    for _ in range(20):
+        code = CODE_PREFIX + "".join(
+            secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH)
+        )
+        exists = db.execute("SELECT 1 FROM codes WHERE code = ?", (code,)).fetchone()
+        if exists is None:
+            return code
+    raise ServiceError(["未能生成不冲突的补发码，请重试"])
+
+
+def _replacement_record(db, repl):
+    row = db.execute(
+        "SELECT r.*, c.status AS new_code_status FROM replacements r"
+        " JOIN codes c ON c.id = r.new_code_id WHERE r.id = ?",
+        (repl["id"],),
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "request_id": row["request_id"],
+        "old_code": row["old_code"],
+        "new_code": row["new_code"],
+        "stratum": row["stratum"],
+        "group_name": row["group_name"],
+        "reason": row["reason"],
+        "requested_by": row["requested_by"],
+        "created_at": row["created_at"],
+        "new_code_status": row["new_code_status"],
+    }
+
+
+def replace_code(db, study, old_code, reason, request_id, username):
+    """样品损毁补发。
+
+    返回 (record, replayed)：replayed=True 表示命中同请求标识的原结果。
+    规则：
+    - 原码须存在且当前有效；原因/请求标识不能为空；研究须仍处盲态；
+    - 原码立即作废（保留历史与替换链），新码继承原分层与处理组；
+    - 同研究相同 request_id 重试返回原记录；改换 old_code/reason 则拒绝；
+    - 不同请求并发补发同一有效码只成功一次（BEGIN IMMEDIATE 串行化）。
+    """
+    old_code = (old_code or "").strip()
+    reason = (reason or "").strip()
+    request_id = (request_id or "").strip()
+
+    # 幂等命中优先：即便原码后来作废、研究后来揭盲，重试仍返回原记录
+    if request_id:
+        existing = db.execute(
+            "SELECT * FROM replacements WHERE study_id = ? AND request_id = ?",
+            (study["id"], request_id),
+        ).fetchone()
+        if existing is not None:
+            if existing["old_code"] != old_code or existing["reason"] != reason:
+                raise ReplacementConflictError(
+                    [
+                        f"请求标识「{request_id}」已用于样品码 {existing['old_code']} 的补发"
+                        "（原因亦须一致），不能改换样品码或原因"
+                    ]
+                )
+            return _replacement_record(db, existing), True
+
+    errors = []
+    if not old_code:
+        errors.append("原样品码不能为空")
+    if not reason:
+        errors.append("补发原因不能为空")
+    if not request_id:
+        errors.append("请求标识不能为空")
+    if errors:
+        raise ServiceError(errors)
+
+    if study["status"] == "unblinded":
+        raise ServiceError(["研究已揭盲，不能再办理补发"])
+
+    old = db.execute(
+        "SELECT * FROM codes WHERE study_id = ? AND code = ?",
+        (study["id"], old_code),
+    ).fetchone()
+    if old is None:
+        raise ServiceError([f"样品码 {old_code} 不存在"])
+    if old["status"] != "active":
+        replaced = db.execute(
+            "SELECT code FROM codes WHERE id = ?", (old["replaced_by_id"],)
+        ).fetchone()
+        hint = f"，已由 {replaced['code']} 替换" if replaced else ""
+        raise ServiceError([f"样品码 {old_code} 已作废{hint}，不能重复补发"])
+
+    now = utcnow()
+
+    # 立即取写锁：并发补发在此串行，失败者在锁内重新校验状态/幂等
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        recheck = db.execute(
+            "SELECT * FROM replacements WHERE study_id = ? AND request_id = ?",
+            (study["id"], request_id),
+        ).fetchone()
+        if recheck is not None:
+            db.commit()
+            if recheck["old_code"] != old_code or recheck["reason"] != reason:
+                raise ReplacementConflictError(
+                    [f"请求标识「{request_id}」已用于其它补发，参数不一致，已拒绝"]
+                )
+            return _replacement_record(db, recheck), True
+
+        old = db.execute(
+            "SELECT * FROM codes WHERE id = ?", (old["id"],)
+        ).fetchone()
+        if old is None:
+            db.rollback()
+            raise ServiceError([f"样品码 {old_code} 不存在"])
+        if old["status"] != "active":
+            db.rollback()
+            raise ServiceError([f"样品码 {old_code} 已作废，不能重复补发"])
+
+        new_code = _new_replacement_code(db)
+        cur = db.execute(
+            "INSERT INTO codes (code, study_id, batch_id, stratum, group_name,"
+            " issued_at, status, replaced_by_id)"
+            " VALUES (?, ?, NULL, ?, ?, ?, 'active', NULL)",
+            (new_code, study["id"], old["stratum"], old["group_name"], now),
+        )
+        new_id = cur.lastrowid
+        # 条件更新：只有仍有效时才作废，保证并发补发只成功一次
+        cur = db.execute(
+            "UPDATE codes SET status = 'voided', replaced_by_id = ?"
+            " WHERE id = ? AND status = 'active'",
+            (new_id, old["id"]),
+        )
+        if cur.rowcount != 1:
+            db.rollback()
+            raise ServiceError([f"样品码 {old_code} 已作废，不能重复补发"])
+
+        repl_cur = db.execute(
+            "INSERT INTO replacements (study_id, request_id, old_code_id, old_code,"
+            " new_code_id, new_code, stratum, group_name, reason, requested_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                study["id"],
+                request_id,
+                old["id"],
+                old["code"],
+                new_id,
+                new_code,
+                old["stratum"],
+                old["group_name"],
+                reason,
+                username,
+                now,
+            ),
+        )
+        db.commit()
+    except ReplacementConflictError:
+        raise
+    except sqlite3.Error:
+        db.rollback()
+        raise
+    repl = db.execute(
+        "SELECT * FROM replacements WHERE id = ?", (repl_cur.lastrowid,)
+    ).fetchone()
+    return _replacement_record(db, repl), False
+
+
+def get_replacements(db, study_id):
+    """研究的完整补发链（按时间顺序）。"""
     return [
         dict(r)
         for r in db.execute(
-            "SELECT code, stratum, group_name, batch_id, issued_at"
-            " FROM codes WHERE study_id = ? ORDER BY code",
+            "SELECT id, study_id, request_id, old_code, new_code, stratum,"
+            " group_name, reason, requested_by, created_at"
+            " FROM replacements WHERE study_id = ? ORDER BY id",
             (study_id,),
         ).fetchall()
     ]
+
+
+# ---------------------------------------------------------------- 映射与揭盲
+
+def get_codes_with_chain(db, study_id):
+    """样品码列表（含有效状态与替换关系），按发放顺序返回。"""
+    return [
+        dict(r)
+        for r in db.execute(
+            """
+            SELECT c.id, c.code, c.stratum, c.group_name, c.batch_id, c.issued_at,
+                   c.status,
+                   nc.code AS replaced_by_code,
+                   oc.code AS replacement_of_code
+            FROM codes c
+            LEFT JOIN codes nc ON nc.id = c.replaced_by_id
+            LEFT JOIN replacements r ON r.new_code_id = c.id
+            LEFT JOIN codes oc ON oc.id = r.old_code_id
+            WHERE c.study_id = ?
+            ORDER BY c.id
+            """,
+            (study_id,),
+        ).fetchall()
+    ]
+
+
+def get_mapping(db, study_id):
+    return get_codes_with_chain(db, study_id)
 
 
 def can_view_mapping(study, user):
@@ -287,7 +493,17 @@ def unblind_study(db, study, op1, pw1, op2, pw2, reason, min_reason_len):
             errors.append(f"用户「{u['username']}」没有揭盲权限")
 
     rows = db.execute(
-        "SELECT code, stratum, group_name FROM codes WHERE study_id = ? ORDER BY code",
+        """
+        SELECT c.code, c.stratum, c.group_name, c.status,
+               nc.code AS replaced_by_code,
+               oc.code AS replacement_of_code
+        FROM codes c
+        LEFT JOIN codes nc ON nc.id = c.replaced_by_id
+        LEFT JOIN replacements r ON r.new_code_id = c.id
+        LEFT JOIN codes oc ON oc.id = r.old_code_id
+        WHERE c.study_id = ?
+        ORDER BY c.id
+        """,
         (study["id"],),
     ).fetchall()
     if not rows:
@@ -295,6 +511,7 @@ def unblind_study(db, study, op1, pw1, op2, pw2, reason, min_reason_len):
     if errors:
         raise ServiceError(errors)
 
+    replacements = get_replacements(db, study["id"])
     now = utcnow()
     snapshot = {
         "study_id": study["id"],
@@ -304,6 +521,8 @@ def unblind_study(db, study, op1, pw1, op2, pw2, reason, min_reason_len):
         "operators": [u1["username"], u2["username"]],
         "reason": reason,
         "mapping": [dict(r) for r in rows],
+        # 完整补发链：原码/新码、分层、处理组、原因与请求标识全部留档
+        "replacements": replacements,
     }
     cur = db.execute(
         "INSERT INTO unblinding_events (study_id, operator1, operator2, reason, snapshot, created_at)"
