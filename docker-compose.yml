@@ -1,0 +1,22 @@
+services:
+  web:
+    build: .
+    container_name: blind-coding
+    ports:
+      - "8000:8000"
+    environment:
+      # 生产环境务必通过 .env 或环境变量覆盖
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DATABASE: /data/blind.db
+      DEFAULT_SEED: ${DEFAULT_SEED:-20260101}
+      MIN_REASON_LENGTH: ${MIN_REASON_LENGTH:-10}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      OPERATOR1_PASSWORD: ${OPERATOR1_PASSWORD:-op123456}
+      OPERATOR2_PASSWORD: ${OPERATOR2_PASSWORD:-op234567}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:-view1234}
+    volumes:
+      - blind-data:/data
+    restart: unless-stopped
+
+volumes:
+  blind-data:

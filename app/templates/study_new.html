@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}新建研究 · 盲法编码管理{% endblock %}
+{% block content %}
+<h1>新建研究</h1>
+<form method="post" class="card">
+  <label>研究名称 <input name="name" required placeholder="例如：ABC-2026-001"></label>
+  <label>随机种子（留空使用系统默认 {{ default_seed }}；创建后固定不变）
+    <input name="seed" type="number" placeholder="{{ default_seed }}">
+  </label>
+  <label>处理组（逗号分隔，至少 2 个）
+    <input name="groups" required placeholder="例如：试验药, 安慰剂">
+  </label>
+  <label>分层与每层样品数量（每行一条，格式：分层名=数量；数量须能被处理组数整除）
+    <textarea name="strata" rows="5" required placeholder="中心1=20&#10;中心2=20"></textarea>
+  </label>
+  <button type="submit">创建研究</button>
+</form>
+<p class="hint">提示：分层数量留空或不平衡不会阻止创建，但会在生成样品码时被拒绝。</p>
+{% endblock %}

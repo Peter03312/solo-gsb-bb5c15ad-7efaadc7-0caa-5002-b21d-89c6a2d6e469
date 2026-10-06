@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}揭盲快照 #{{ event['id'] }}{% endblock %}
+{% block content %}
+<h1>揭盲快照 #{{ event['id'] }}：{{ study['name'] }}</h1>
+<div class="card">
+  <p>揭盲时间：{{ event['created_at'] }} ｜ 操作者：{{ event['operator1'] }}、{{ event['operator2'] }}</p>
+  <p>理由：{{ event['reason'] }}</p>
+  <p>研究种子：<code>{{ snapshot['seed'] }}</code></p>
+</div>
+<h2>映射快照（{{ snapshot['mapping']|length }} 条）</h2>
+<table>
+  <thead><tr><th>样品码</th><th>分层</th><th>处理组</th></tr></thead>
+  <tbody>
+    {% for m in snapshot['mapping'] %}
+    <tr>
+      <td><code>{{ m['code'] }}</code></td>
+      <td>{{ m['stratum'] }}</td>
+      <td><strong>{{ m['group_name'] }}</strong></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p><a href="{{ url_for('routes.study_detail', study_id=study['id']) }}">← 返回研究详情</a></p>
+{% endblock %}

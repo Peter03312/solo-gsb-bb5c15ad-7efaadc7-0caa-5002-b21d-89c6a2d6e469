@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}揭盲 · {{ study['name'] }}{% endblock %}
+{% block content %}
+<h1>揭盲：{{ study['name'] }}</h1>
+<div class="card">
+  <p>揭盲需要 <strong>两位不同操作者</strong> 的账号与密码，以及完整理由（不少于 {{ min_reason_length }} 个字符）。
+     任一条件不满足将不执行任何变更，仅返回原因。</p>
+  <form method="post">
+    <fieldset>
+      <legend>操作者一</legend>
+      <label>用户名 <input name="operator1" required></label>
+      <label>密码 <input name="password1" type="password" required></label>
+    </fieldset>
+    <fieldset>
+      <legend>操作者二</legend>
+      <label>用户名 <input name="operator2" required></label>
+      <label>密码 <input name="password2" type="password" required></label>
+    </fieldset>
+    <label>揭盲理由
+      <textarea name="reason" rows="3" required minlength="{{ min_reason_length }}"
+                placeholder="例如：受试者 S003 发生严重不良事件，需紧急揭盲以指导救治"></textarea>
+    </label>
+    <button type="submit" class="warn"
+            onclick="return confirm('揭盲后研究状态不可逆，确认继续？');">确认揭盲</button>
+  </form>
+</div>
+{% endblock %}

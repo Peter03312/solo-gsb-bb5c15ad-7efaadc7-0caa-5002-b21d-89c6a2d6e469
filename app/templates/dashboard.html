@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}研究列表 · 盲法编码管理{% endblock %}
+{% block content %}
+<h1>研究列表</h1>
+{% if studies %}
+<table>
+  <thead>
+    <tr><th>ID</th><th>名称</th><th>种子</th><th>状态</th><th>批次数</th><th>已发放样品码</th><th>创建人</th><th>创建时间</th></tr>
+  </thead>
+  <tbody>
+    {% for s in studies %}
+    <tr>
+      <td>{{ s['id'] }}</td>
+      <td><a href="{{ url_for('routes.study_detail', study_id=s['id']) }}">{{ s['name'] }}</a></td>
+      <td>{{ s['seed'] }}</td>
+      <td><span class="badge {{ s['status'] }}">{{ '已揭盲' if s['status'] == 'unblinded' else '盲态中' }}</span></td>
+      <td>{{ s['batch_count'] }}</td>
+      <td>{{ s['code_count'] }}</td>
+      <td>{{ s['created_by'] }}</td>
+      <td>{{ s['created_at'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>暂无研究。{% if g.user['role'] == 'admin' %}<a href="{{ url_for('routes.study_new') }}">新建研究</a>{% endif %}</p>
+{% endif %}
+{% endblock %}

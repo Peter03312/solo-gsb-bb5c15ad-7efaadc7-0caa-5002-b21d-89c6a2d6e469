@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}登录 · 盲法编码管理{% endblock %}
+{% block content %}
+<h1>登录</h1>
+<form method="post" class="card narrow">
+  <label>用户名 <input name="username" required autofocus></label>
+  <label>密码 <input name="password" type="password" required></label>
+  <button type="submit">登录</button>
+</form>
+{% endblock %}
