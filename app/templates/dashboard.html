@@ -5,7 +5,7 @@
 {% if studies %}
 <table>
   <thead>
-    <tr><th>ID</th><th>名称</th><th>种子</th><th>状态</th><th>批次数</th><th>已发放样品码</th><th>创建人</th><th>创建时间</th></tr>
+    <tr><th>ID</th><th>名称</th><th>种子</th><th>状态</th><th>批次数</th><th>有效样品码</th><th>历史码</th><th>创建人</th><th>创建时间</th></tr>
   </thead>
   <tbody>
     {% for s in studies %}
@@ -15,7 +15,8 @@
       <td>{{ s['seed'] }}</td>
       <td><span class="badge {{ s['status'] }}">{{ '已揭盲' if s['status'] == 'unblinded' else '盲态中' }}</span></td>
       <td>{{ s['batch_count'] }}</td>
-      <td>{{ s['code_count'] }}</td>
+      <td>{{ s['active_code_count'] }}</td>
+      <td>{{ s['code_count'] - s['active_code_count'] }}</td>
       <td>{{ s['created_by'] }}</td>
       <td>{{ s['created_at'] }}</td>
     </tr>

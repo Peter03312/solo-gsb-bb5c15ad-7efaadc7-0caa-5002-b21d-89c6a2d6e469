@@ -17,7 +17,12 @@ from flask import (
 from . import services
 from .auth import authenticate, login_required, role_required
 from .db import get_db
-from .services import ConflictError, ServiceError
+from .services import (
+    ConflictError,
+    IdempotencyConflict,
+    NotFoundError,
+    ServiceError,
+)
 
 bp = Blueprint("routes", __name__)
 
@@ -38,6 +43,8 @@ def dashboard():
         """
         SELECT s.*,
                (SELECT COUNT(*) FROM codes c WHERE c.study_id = s.id)   AS code_count,
+               (SELECT COALESCE(COUNT(*), 0) FROM codes c WHERE c.study_id = s.id
+                  AND c.status = 'active') AS active_code_count,
                (SELECT COUNT(*) FROM batches b WHERE b.study_id = s.id) AS batch_count
         FROM studies s ORDER BY s.id DESC
         """
@@ -82,7 +89,18 @@ def study_detail(study_id):
         "SELECT * FROM treatment_groups WHERE study_id = ? ORDER BY id", (study_id,)
     ).fetchall()
     codes = db.execute(
-        "SELECT * FROM codes WHERE study_id = ? ORDER BY id", (study_id,)
+        """
+        SELECT c.*, oc.code AS replaces_code, nc.code AS replaced_by_code
+        FROM codes c
+        LEFT JOIN codes oc ON oc.id = c.replaces_id
+        LEFT JOIN codes nc ON nc.id = c.replaced_by_id
+        WHERE c.study_id = ? ORDER BY c.id
+        """,
+        (study_id,),
+    ).fetchall()
+    replacements = db.execute(
+        "SELECT * FROM replacement_requests WHERE study_id = ? ORDER BY id",
+        (study_id,),
     ).fetchall()
     events = db.execute(
         "SELECT * FROM unblinding_events WHERE study_id = ? ORDER BY id DESC",
@@ -94,6 +112,7 @@ def study_detail(study_id):
         strata=strata,
         groups=groups,
         codes=codes,
+        replacements=replacements,
         events=events,
         can_view_mapping=services.can_view_mapping(study, g.user),
     )
@@ -114,6 +133,35 @@ def generate(study_id):
             flash(f"冲突样品码：{code}", "error")
         if len(e.conflicts) > 20:
             flash(f"……冲突共 {len(e.conflicts)} 个，仅列出前 20 个", "error")
+    except ServiceError as e:
+        for err in e.errors:
+            flash(err, "error")
+    return redirect(url_for("routes.study_detail", study_id=study_id))
+
+
+@bp.route("/studies/<int:study_id>/replace", methods=("POST",))
+@role_required("admin")
+def replace_code(study_id):
+    db = get_db()
+    study = _get_study_or_404(db, study_id)
+    try:
+        replacement, created = services.replace_code(
+            db,
+            study,
+            request.form.get("original_code", ""),
+            request.form.get("reason", ""),
+            request.form.get("request_id", ""),
+            g.user["username"],
+        )
+        prefix = "补发成功" if created else "请求已处理（幂等重试）"
+        flash(
+            f"{prefix}：{replacement['original_code']} 已作废，"
+            f"新样品码为 {replacement['replacement_code']}",
+            "ok",
+        )
+    except NotFoundError as e:
+        for err in e.errors:
+            flash(err, "error")
     except ServiceError as e:
         for err in e.errors:
             flash(err, "error")
@@ -215,7 +263,21 @@ def api_study(study_id):
     ).fetchone()
     if study is None:
         return jsonify(ok=False, errors=["研究不存在"]), 404
-    return jsonify(ok=True, study=dict(study))
+    counts = db.execute(
+        "SELECT"
+        " COUNT(*) AS total_count,"
+        " COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active_count,"
+        " COALESCE(SUM(CASE WHEN status = 'voided' THEN 1 ELSE 0 END), 0) AS voided_count"
+        " FROM codes WHERE study_id = ?",
+        (study_id,),
+    ).fetchone()
+    detail = dict(study)
+    detail.update(
+        total_code_count=counts["total_count"],
+        active_code_count=counts["active_count"],
+        voided_code_count=counts["voided_count"],
+    )
+    return jsonify(ok=True, study=detail)
 
 
 @bp.post("/api/studies")
@@ -259,6 +321,48 @@ def api_generate(study_id):
     return jsonify(ok=True, batch_id=batch_id, count=count), 201
 
 
+@bp.post("/api/studies/<int:study_id>/replacement")
+@bp.post("/api/studies/<int:study_id>/replacements")
+@role_required("admin")
+def api_replace_code(study_id):
+    db = get_db()
+    study = db.execute("SELECT * FROM studies WHERE id = ?", (study_id,)).fetchone()
+    if study is None:
+        return jsonify(ok=False, errors=["研究不存在"]), 404
+    data = request.get_json(silent=True) or request.form
+    try:
+        replacement, created = services.replace_code(
+            db,
+            study,
+            data.get("original_code", ""),
+            data.get("reason", ""),
+            data.get("request_id", ""),
+            g.user["username"],
+        )
+    except NotFoundError:
+        return jsonify(ok=False, errors=["原样品码不存在"]), 404
+    except IdempotencyConflict as e:
+        return jsonify(ok=False, errors=e.errors), 409
+    except ServiceError as e:
+        status = 409 if any("已作废" in err for err in e.errors) else 400
+        return jsonify(ok=False, errors=e.errors), status
+    return jsonify(ok=True, replacement=replacement, retried=not created), (
+        200 if not created else 201
+    )
+
+
+@bp.get("/api/studies/<int:study_id>/replacement-requests")
+@login_required
+def api_replacement_requests(study_id):
+    db = get_db()
+    study = db.execute("SELECT * FROM studies WHERE id = ?", (study_id,)).fetchone()
+    if study is None:
+        return jsonify(ok=False, errors=["研究不存在"]), 404
+    return jsonify(
+        ok=True, replacements=services.get_replacement_chain(db, study_id)
+    )
+
+
 @bp.get("/api/studies/<int:study_id>/codes")
 @login_required
 def api_codes(study_id):
@@ -268,8 +372,12 @@ def api_codes(study_id):
         return jsonify(ok=False, errors=["研究不存在"]), 404
     show_group = services.can_view_mapping(study, g.user)
     rows = db.execute(
-        "SELECT code, stratum, group_name, batch_id, issued_at"
-        " FROM codes WHERE study_id = ? ORDER BY id",
+        "SELECT c.code, c.stratum, c.group_name, c.batch_id, c.issued_at, c.status,"
+        "       oc.code AS replaces_code, nc.code AS replaced_by_code"
+        " FROM codes c"
+        " LEFT JOIN codes oc ON oc.id = c.replaces_id"
+        " LEFT JOIN codes nc ON nc.id = c.replaced_by_id"
+        " WHERE c.study_id = ? ORDER BY c.id",
         (study_id,),
     ).fetchall()
     codes = []

@@ -15,7 +15,9 @@ label { display: block; margin: .7rem 0; font-size: .92rem; }
 input, textarea { width: 100%; padding: .45rem; border: 1px solid #bbb; border-radius: 4px; font-size: .95rem; margin-top: .2rem; }
 button, .button { display: inline-block; background: #1f3a5f; color: #fff; border: 0; border-radius: 4px; padding: .5rem 1.1rem; font-size: .95rem; cursor: pointer; text-decoration: none; }
 button.warn, .button.warn { background: #a33; }
-.actions { display: flex; gap: .8rem; align-items: center; margin: 1rem 0; }
+.actions { display: flex; gap: .8rem; align-items: center; margin: 1rem 0; flex-wrap: wrap; }
+.inline-form { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.inline-form input { width: 150px; margin-top: 0; }
 fieldset { border: 1px solid #ccc; border-radius: 6px; margin: .8rem 0; }
 .flash { padding: .6rem .9rem; border-radius: 4px; margin: .5rem 0; font-size: .92rem; }
 .flash.ok { background: #e2f4e5; border: 1px solid #8cc795; }

@@ -45,13 +45,31 @@ CREATE TABLE IF NOT EXISTS batches (
 );
 
 CREATE TABLE IF NOT EXISTS codes (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    code       TEXT UNIQUE NOT NULL,  -- 全局唯一：样品码一经发放不可复用
-    study_id   INTEGER NOT NULL REFERENCES studies (id) ON DELETE CASCADE,
-    batch_id   INTEGER NOT NULL REFERENCES batches (id) ON DELETE CASCADE,
-    stratum    TEXT NOT NULL,
-    group_name TEXT NOT NULL,         -- 盲底：样品码 -> 处理组 的映射
-    issued_at  TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    code           TEXT UNIQUE NOT NULL,  -- 全局唯一：样品码一经发放不可复用
+    study_id       INTEGER NOT NULL REFERENCES studies (id) ON DELETE CASCADE,
+    batch_id       INTEGER REFERENCES batches (id) ON DELETE CASCADE,  -- 补发码不属于生成批次
+    stratum        TEXT NOT NULL,
+    group_name     TEXT NOT NULL,         -- 盲底：样品码 -> 处理组 的映射
+    issued_at      TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'voided')),
+    replaces_id    INTEGER REFERENCES codes (id),
+    replaced_by_id INTEGER REFERENCES codes (id),
+    UNIQUE (replaces_id)
+);
+
+CREATE TABLE IF NOT EXISTS replacement_requests (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id         INTEGER NOT NULL REFERENCES studies (id) ON DELETE CASCADE,
+    request_id       TEXT NOT NULL,
+    original_code    TEXT NOT NULL,
+    replacement_code TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    requested_by     TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE (study_id, request_id),
+    UNIQUE (study_id, original_code)
 );
 
 CREATE TABLE IF NOT EXISTS unblinding_events (
@@ -96,9 +114,62 @@ def _seed_users(db):
     db.commit()
 
 
+def _migrate_codes_table(db):
+    """为既有数据库补齐样品状态和补发链字段。
+
+    旧表中 batch_id 为 NOT NULL；补发码不属于初始生成批次，因此迁移时将其
+    改为可空，并在单事务内重建 codes 表。
+    """
+    columns = {r["name"] for r in db.execute("PRAGMA table_info(codes)").fetchall()}
+    if not columns or "status" in columns:
+        return
+
+    db.commit()
+    db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        db.execute("ALTER TABLE codes RENAME TO codes_old")
+        db.execute(
+            """
+            CREATE TABLE codes (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                code           TEXT UNIQUE NOT NULL,
+                study_id       INTEGER NOT NULL REFERENCES studies (id) ON DELETE CASCADE,
+                batch_id       INTEGER REFERENCES batches (id) ON DELETE CASCADE,
+                stratum        TEXT NOT NULL,
+                group_name     TEXT NOT NULL,
+                issued_at      TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'active'
+                               CHECK (status IN ('active', 'voided')),
+                replaces_id    INTEGER REFERENCES codes (id),
+                replaced_by_id INTEGER REFERENCES codes (id),
+                UNIQUE (replaces_id)
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO codes (id, code, study_id, batch_id, stratum, group_name,
+                               issued_at, status, replaces_id, replaced_by_id)
+            SELECT id, code, study_id, batch_id, stratum, group_name,
+                   issued_at, 'active', NULL, NULL
+            FROM codes_old
+            """
+        )
+        db.execute("DROP TABLE codes_old")
+        db.commit()
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
+
+
 def init_app(app):
     app.teardown_appcontext(close_db)
     with app.app_context():
         db = get_db()
         db.executescript(SCHEMA)
+        _migrate_codes_table(db)
+        db.executescript(SCHEMA)
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codes_study_status"
+            " ON codes (study_id, status)"
+        )
         _seed_users(db)

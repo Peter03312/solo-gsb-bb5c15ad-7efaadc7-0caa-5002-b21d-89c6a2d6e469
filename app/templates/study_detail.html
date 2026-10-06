@@ -24,6 +24,12 @@
         onsubmit="return confirm('确认按固定种子生成样品码？生成后编码不可复用。');">
     <button type="submit">生成样品码</button>
   </form>
+  <form method="post" action="{{ url_for('routes.replace_code', study_id=study['id']) }}" class="inline-form">
+    <input name="original_code" placeholder="当前有效样品码" required>
+    <input name="reason" placeholder="补发原因" required>
+    <input name="request_id" placeholder="唯一请求标识" required>
+    <button type="submit">补发损毁样品</button>
+  </form>
   {% endif %}
   {% if can_view_mapping %}
     <a class="button" href="{{ url_for('routes.mapping', study_id=study['id']) }}">查看映射（盲底）</a>
@@ -49,17 +55,41 @@
 </table>
 {% endif %}
 
+{% if replacements %}
+<h2>补发记录（{{ replacements|length }}）</h2>
+<table>
+  <thead><tr><th>请求标识</th><th>原样品码</th><th>新样品码</th><th>原因</th><th>办理人</th><th>时间</th></tr></thead>
+  <tbody>
+    {% for r in replacements %}
+    <tr>
+      <td><code>{{ r['request_id'] }}</code></td>
+      <td><code>{{ r['original_code'] }}</code></td>
+      <td><code>{{ r['replacement_code'] }}</code></td>
+      <td>{{ r['reason'] }}</td>
+      <td>{{ r['requested_by'] }}</td>
+      <td>{{ r['created_at'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <h2>样品码（{{ codes|length }}）</h2>
 {% if codes %}
 <table>
-  <thead><tr><th>样品码</th><th>分层</th><th>处理组</th><th>批次</th><th>发放时间</th></tr></thead>
+  <thead><tr><th>样品码</th><th>状态</th><th>分层</th><th>处理组</th><th>替换关系</th><th>批次</th><th>发放时间</th></tr></thead>
   <tbody>
     {% for c in codes %}
     <tr>
       <td><code>{{ c['code'] }}</code></td>
+      <td>{{ '有效' if c['status'] == 'active' else '已作废' }}</td>
       <td>{{ c['stratum'] }}</td>
       <td>{{ c['group_name'] if can_view_mapping else '●●●（盲态）' }}</td>
-      <td>#{{ c['batch_id'] }}</td>
+      <td>
+        {% if c['replaces_code'] %}替换 <code>{{ c['replaces_code'] }}</code>{% endif %}
+        {% if c['replaced_by_code'] %}由 <code>{{ c['replaced_by_code'] }}</code> 替换{% endif %}
+      </td>
+      <td>{% if c['batch_id'] %}#{{ c['batch_id'] }}{% else %}补发{% endif %}</td>
       <td>{{ c['issued_at'] }}</td>
     </tr>
     {% endfor %}
